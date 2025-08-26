@@ -1,33 +1,33 @@
+'use strict';
+
 /*
  * TTH Blocker Extension for AirDC++
- * Version: 1.20.40
+ * Version: 1.20.44
  * Description: Blocks downloads based on TTH values from JSON blocklists.
- * Adds context menu items in search results and filelists to append selected files' TTHs to custom.blocklist.json.
+ * Adds context menu items in search results and filelists to append selected files' TTHs to internal_blocklist.json.
  * Supports multiple read-only blocklists in /blocklists/ folder with dynamic detection and enable/disable settings.
  * Auto-updates remote blocklists with a 'url' field every X minutes set in configure window, checks version/updated_at.
  * Change Log:
- * - [Previous changes omitted, see 1.20.22]
- * - 1.20.39: Allow text/plain Content-Type if valid JSON, log response headers, strengthen URL validation.
- * - 1.20.40: Treat HTTP 304 as success, handle 409 settings errors, log invalid TTHs, optimize watch reloads, add cache delay log.
+ * - [Previous changes omitted, see 1.20.43]
+ * - 1.20.43: Fixed duplicate System Log messages for internal blocklist updates, corrected setting key mismatch (internal_block_list), optimized logging for clarity.
+ * - 1.20.44: Removed redundant "Updated blocklist" message for remote blocklist updates, added restart prompt to new blocklist detection message.
  */
-
-'use strict';
 
 const fs = require('fs');
 const path = require('path');
 const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 
-const EXTENSION_VERSION = '1.20.40';
+const EXTENSION_VERSION = '1.20.44';
 const CONFIG_VERSION = 1;
 const BLOCKLIST_DIR = path.resolve(__dirname, '..', 'blocklists');
-const CUSTOM_BLOCKLIST_FILE = path.join(BLOCKLIST_DIR, 'custom.blocklist.json');
+const INTERNAL_BLOCKLIST_FILE = path.join(BLOCKLIST_DIR, 'internal_blocklist.json');
 let blockedTTHSet = new Set();
 let blocklistFiles = [];
 let blocklistTTHMap = new Map();
 let blocklistETags = new Map();
 let blocklistVersions = new Map();
 let updateIntervalId = null;
-let lastUpdateWriteTime = 0; // Track last fetch write time to avoid redundant watch reloads
+let lastUpdateWriteTime = new Map(); // Track mtimeMs per file
 const { addContextMenuItems } = require('airdcpp-apisocket');
 const SettingsManager = require('airdcpp-extension-settings');
 
@@ -62,6 +62,7 @@ function isValidTTH(id) {
 }
 
 function isValidBlocklistURL(url) {
+  if (url === 'Internal') return true;
   try {
     const parsed = new URL(url);
     const isValidProtocol = parsed.protocol === 'https:' || parsed.protocol === 'http:';
@@ -76,46 +77,48 @@ function validateBlocklistFile(filePath) {
   try {
     const data = fs.readFileSync(filePath, 'utf-8');
     if (data.trim() === '') {
-      console.log(`[TTH Block] Blocklist ${filePath} is empty, ignoring`);
-      return { valid: false, url: null, version: null, updated_at: null };
+      console.log(`[TTH Block] Blocklist ${filePath} is empty, initializing`);
+      const defaultBlocklist = {
+        url: filePath === INTERNAL_BLOCKLIST_FILE ? 'Internal' : null,
+        version: filePath === INTERNAL_BLOCKLIST_FILE ? 'Internal' : null,
+        updated_at: new Date().toISOString(),
+        description: filePath === INTERNAL_BLOCKLIST_FILE ? 'Internal' : '',
+        tths: []
+      };
+      fs.writeFileSync(filePath, JSON.stringify(defaultBlocklist, null, 2), 'utf-8');
+      return { valid: true, url: defaultBlocklist.url, version: defaultBlocklist.version, updated_at: defaultBlocklist.updated_at, description: defaultBlocklist.description };
     }
     const blocklist = JSON.parse(data);
-    if (!Array.isArray(blocklist.tths) && filePath !== CUSTOM_BLOCKLIST_FILE) {
+    if (!blocklist.url || !isValidBlocklistURL(blocklist.url)) {
+      console.error(`[TTH Block] Invalid or missing URL in ${filePath}: ${blocklist.url || 'none'}`);
+      return { valid: false, url: null, version: blocklist.version || null, updated_at: blocklist.updated_at || null, description: blocklist.description || '' };
+    }
+    if (!Array.isArray(blocklist.tths)) {
       console.error(`[TTH Block] Invalid blocklist format in ${filePath}: 'tths' not an array`);
-      return { valid: false, url: blocklist.url || null, version: blocklist.version || null, updated_at: blocklist.updated_at || null };
+      return { valid: false, url: blocklist.url, version: blocklist.version || null, updated_at: blocklist.updated_at || null, description: blocklist.description || '' };
     }
-    if (filePath === CUSTOM_BLOCKLIST_FILE && !Array.isArray(blocklist)) {
-      console.error(`[TTH Block] Invalid custom blocklist format in ${filePath}: not an array`);
-      return { valid: false, url: null, version: null, updated_at: null };
+    const hasValidTTH = blocklist.tths.some(item => item.tth && isValidTTH(item.tth));
+    if (!hasValidTTH && blocklist.tths.length > 0) {
+      console.error(`[TTH Block] No valid TTHs found in ${filePath}`);
+      return { valid: false, url: blocklist.url, version: blocklist.version || null, updated_at: blocklist.updated_at || null, description: blocklist.description || '' };
     }
-    const hasValidTTH = filePath === CUSTOM_BLOCKLIST_FILE
-      ? blocklist.some(item => item.tth && isValidTTH(item.tth))
-      : blocklist.tths?.some(item => item.tth && isValidTTH(item.tth));
-    if (!hasValidTTH) {
-      console.error(`[TTH Block] No valid TTHs found in ${filePath}, ignoring`);
-      return { valid: false, url: blocklist.url || null, version: blocklist.version || null, updated_at: blocklist.updated_at || null };
-    }
-    if (blocklist.url && !isValidBlocklistURL(blocklist.url)) {
-      console.error(`[TTH Block] Invalid URL in ${filePath}: ${blocklist.url}`);
-      return { valid: true, url: null, version: blocklist.version || null, updated_at: blocklist.updated_at || null };
-    }
-    return { valid: true, url: blocklist.url || null, version: blocklist.version || null, updated_at: blocklist.updated_at || null };
+    return { valid: true, url: blocklist.url, version: blocklist.version || null, updated_at: blocklist.updated_at || null, description: blocklist.description || '' };
   } catch (err) {
     console.error(`[TTH Block] Failed to validate blocklist ${filePath}: ${err.message}`);
-    return { valid: false, url: null, version: null, updated_at: null };
+    return { valid: false, url: null, version: null, updated_at: null, description: '' };
   }
 }
 
 function getBlocklistFiles() {
   try {
-    const files = fs.readdirSync(BLOCKLIST_DIR).filter(file => file.endsWith('.json') && file !== path.basename(CUSTOM_BLOCKLIST_FILE));
+    const files = fs.readdirSync(BLOCKLIST_DIR).filter(file => file.endsWith('.json'));
     const blocklists = files
       .map(file => {
         const filePath = path.join(BLOCKLIST_DIR, file);
-        const { valid, url, version, updated_at } = validateBlocklistFile(filePath);
+        const { valid, url, version, updated_at, description } = validateBlocklistFile(filePath);
         if (valid) {
           const stats = fs.statSync(filePath);
-          return { file, path: filePath, mtime: stats.mtimeMs, url, version, updated_at };
+          return { file, path: filePath, mtime: stats.mtimeMs, url, version, updated_at, description };
         }
         return null;
       })
@@ -131,8 +134,8 @@ function getBlocklistFiles() {
 async function updateSettingsDefinitions(socket, extensionName, newBlocklists) {
   const SettingDefinitions = [
     {
-      key: 'custom_block_list',
-      title: 'Enable/Disable custom blocklist',
+      key: 'internal_block_list',
+      title: 'Enable/Disable internal blocklist',
       default_value: true,
       type: 'boolean'
     },
@@ -143,12 +146,14 @@ async function updateSettingsDefinitions(socket, extensionName, newBlocklists) {
       type: 'number',
       min: 1
     },
-    ...newBlocklists.map(blocklist => ({
-      key: `blocklist_${blocklist.file}`,
-      title: `Enable/Disable blocklist ${blocklist.file}`,
-      default_value: true,
-      type: 'boolean'
-    }))
+    ...newBlocklists
+      .filter(blocklist => blocklist.file !== path.basename(INTERNAL_BLOCKLIST_FILE))
+      .map(blocklist => ({
+        key: `blocklist_${blocklist.file}`,
+        title: `Enable/Disable blocklist ${blocklist.file}${blocklist.description ? ` (${blocklist.description})` : ''}`,
+        default_value: true,
+        type: 'boolean'
+      }))
   ];
   try {
     await socket.post(`extensions/${extensionName}/settings/definitions`, SettingDefinitions);
@@ -176,43 +181,65 @@ function loadBlockedTTHs(socket, settings) {
   blocklistTTHMap.clear();
   blocklistVersions.clear();
 
-  if (settings.getValue('custom_block_list')) {
+  if (settings.getValue('internal_block_list')) {
     try {
-      if (fs.existsSync(CUSTOM_BLOCKLIST_FILE)) {
-        const data = fs.readFileSync(CUSTOM_BLOCKLIST_FILE, 'utf-8');
+      if (fs.existsSync(INTERNAL_BLOCKLIST_FILE)) {
+        const data = fs.readFileSync(INTERNAL_BLOCKLIST_FILE, 'utf-8');
         if (data.trim() === '') {
-          console.log(`[TTH Block] Custom blocklist is empty, initializing with empty array`);
-          fs.writeFileSync(CUSTOM_BLOCKLIST_FILE, JSON.stringify([], null, 2), 'utf-8');
+          console.log(`[TTH Block] Internal blocklist is empty, initializing`);
+          const defaultBlocklist = {
+            url: 'Internal',
+            version: 'Internal',
+            updated_at: new Date().toISOString(),
+            description: 'Internal',
+            tths: []
+          };
+          fs.writeFileSync(INTERNAL_BLOCKLIST_FILE, JSON.stringify(defaultBlocklist, null, 2), 'utf-8');
         } else {
           const blocklist = JSON.parse(data);
-          if (Array.isArray(blocklist)) {
+          if (blocklist.url === 'Internal' && Array.isArray(blocklist.tths)) {
             const tthSet = new Set();
-            blocklist.forEach(item => {
+            blocklist.tths.forEach(item => {
               if (item.tth && isValidTTH(item.tth)) {
                 blockedTTHSet.add(item.tth);
                 tthSet.add(item.tth);
               }
             });
-            blocklistTTHMap.set(path.basename(CUSTOM_BLOCKLIST_FILE), tthSet);
-            console.log(`[TTH Block] Loaded ${tthSet.size} TTH(s) from ${CUSTOM_BLOCKLIST_FILE}`);
+            blocklistTTHMap.set(path.basename(INTERNAL_BLOCKLIST_FILE), tthSet);
+            blocklistVersions.set(path.basename(INTERNAL_BLOCKLIST_FILE), blocklist.version || blocklist.updated_at || null);
+            console.log(`[TTH Block] Loaded ${tthSet.size} TTH(s) from ${INTERNAL_BLOCKLIST_FILE} (description: ${blocklist.description || 'none'})`);
           } else {
-            console.warn(`[TTH Block] Invalid format in ${CUSTOM_BLOCKLIST_FILE}, initializing with empty array`);
-            fs.writeFileSync(CUSTOM_BLOCKLIST_FILE, JSON.stringify([], null, 2), 'utf-8');
+            console.warn(`[TTH Block] Invalid format in ${INTERNAL_BLOCKLIST_FILE}, initializing`);
+            const defaultBlocklist = {
+              url: 'Internal',
+              version: 'Internal',
+              updated_at: new Date().toISOString(),
+              description: 'Internal',
+              tths: []
+            };
+            fs.writeFileSync(INTERNAL_BLOCKLIST_FILE, JSON.stringify(defaultBlocklist, null, 2), 'utf-8');
           }
         }
       } else {
-        console.log(`[TTH Block] Custom blocklist not found, creating empty ${CUSTOM_BLOCKLIST_FILE}`);
-        fs.writeFileSync(CUSTOM_BLOCKLIST_FILE, JSON.stringify([], null, 2), 'utf-8');
+        console.log(`[TTH Block] Internal blocklist not found, creating ${INTERNAL_BLOCKLIST_FILE}`);
+        const defaultBlocklist = {
+          url: 'Internal',
+          version: 'Internal',
+          updated_at: new Date().toISOString(),
+          description: 'Internal',
+          tths: []
+        };
+        fs.writeFileSync(INTERNAL_BLOCKLIST_FILE, JSON.stringify(defaultBlocklist, null, 2), 'utf-8');
       }
     } catch (err) {
-      console.error(`[TTH Block] Failed to load custom blocklist: ${err.message}, initializing with empty array`);
-      fs.writeFileSync(CUSTOM_BLOCKLIST_FILE, JSON.stringify([], null, 2), 'utf-8');
+      console.error(`[TTH Block] Failed to load internal blocklist: ${err.message}`);
     }
   } else {
-    console.log(`[TTH Block] Custom blocklist disabled in settings, skipping load`);
+    console.log(`[TTH Block] Internal blocklist disabled in settings, skipping load`);
   }
 
   blocklistFiles.forEach(blocklist => {
+    if (blocklist.file === path.basename(INTERNAL_BLOCKLIST_FILE)) return;
     const settingKey = `blocklist_${blocklist.file}`;
     let settingValue;
     try {
@@ -239,7 +266,7 @@ function loadBlockedTTHs(socket, settings) {
           });
           blocklistTTHMap.set(blocklist.file, tthSet);
           blocklistVersions.set(blocklist.file, blocklistData.version || blocklistData.updated_at || null);
-          console.log(`[TTH Block] Loaded ${tthSet.size} TTH(s) from ${blocklist.file} (version: ${blocklistData.version || 'none'}, updated_at: ${blocklistData.updated_at || 'none'})`);
+          console.log(`[TTH Block] Loaded ${tthSet.size} TTH(s) from ${blocklist.file} (version: ${blocklistData.version || 'none'}, description: ${blocklistData.description || 'none'})`);
         } else {
           console.error(`[TTH Block] Invalid format in ${blocklist.file}, skipping`);
         }
@@ -252,20 +279,26 @@ function loadBlockedTTHs(socket, settings) {
   });
 }
 
-function updateSingleBlocklist(socket, settings, filename, isFetchUpdate = false) {
+async function updateSingleBlocklist(socket, settings, filename, isFetchUpdate = false) {
   const blocklist = blocklistFiles.find(b => b.file === filename);
   if (!blocklist) {
     console.log(`[TTH Block] Blocklist ${filename} not found in blocklistFiles, treating as new`);
     return false;
   }
-  const settingKey = `blocklist_${filename}`;
   const filePath = blocklist.path;
+  const stats = fs.statSync(filePath);
+  if (lastUpdateWriteTime.get(filename) === stats.mtimeMs) {
+    console.log(`[TTH Block] Skipping reload for ${filename}: no change since last update (mtime: ${stats.mtimeMs})`);
+    return false;
+  }
+  lastUpdateWriteTime.set(filename, stats.mtimeMs);
 
   const oldTTHs = blocklistTTHMap.get(filename) || new Set();
   oldTTHs.forEach(tth => blockedTTHSet.delete(tth));
   blocklistTTHMap.delete(filename);
   console.log(`[TTH Block] Unloaded ${oldTTHs.size} TTH(s) from ${filename}`);
 
+  const settingKey = filename === path.basename(INTERNAL_BLOCKLIST_FILE) ? 'internal_block_list' : `blocklist_${filename}`;
   let settingValue;
   try {
     settingValue = settings.getValue(settingKey);
@@ -287,13 +320,7 @@ function updateSingleBlocklist(socket, settings, filename, isFetchUpdate = false
         });
         blocklistTTHMap.set(filename, tthSet);
         blocklistVersions.set(filename, blocklistData.version || blocklistData.updated_at || null);
-        console.log(`[TTH Block] Loaded ${tthSet.size} TTH(s) from ${filename} (version: ${blocklistData.version || 'none'}, updated_at: ${blocklistData.updated_at || 'none'})`);
-        if (!isFetchUpdate) {
-          socket.post('events', {
-            text: `Updated blocklist ${filename} with ${tthSet.size} TTH(s)`,
-            severity: 'info'
-          });
-        }
+        console.log(`[TTH Block] Loaded ${tthSet.size} TTH(s) from ${filename} (version: ${blocklistData.version || 'none'}, description: ${blocklistData.description || 'none'})`);
         return true;
       } catch (err) {
         console.error(`[TTH Block] Failed to reload blocklist ${filename}: ${err.message}`);
@@ -308,8 +335,8 @@ function updateSingleBlocklist(socket, settings, filename, isFetchUpdate = false
 }
 
 async function fetchAndUpdateBlocklist(socket, settings, blocklist, retries = 3, delay = 1000) {
-  if (!blocklist.url) {
-    console.log(`[TTH Block] No URL for ${blocklist.file}, treating as read-only`);
+  if (blocklist.url === 'Internal') {
+    console.log(`[TTH Block] Skipping update for ${blocklist.file} (Internal)`);
     return false;
   }
   if (!isValidBlocklistURL(blocklist.url)) {
@@ -364,10 +391,10 @@ async function fetchAndUpdateBlocklist(socket, settings, blocklist, retries = 3,
       const etag = response.headers.get('ETag') || '';
       blocklistETags.set(blocklist.file, etag);
       blocklistVersions.set(blocklist.file, newVersion);
-      lastUpdateWriteTime = Date.now();
+      lastUpdateWriteTime.set(blocklist.file, Date.now());
       fs.writeFileSync(blocklist.path, JSON.stringify(data, null, 2), 'utf-8');
       const stats = fs.statSync(blocklist.path);
-      console.log(`[TTH Block] Updated ${blocklist.file} from ${blocklist.url} (version: ${newVersion || 'none'}, size: ${stats.size} bytes)`);
+      console.log(`[TTH Block] Updated ${blocklist.file} from ${blocklist.url} (version: ${newVersion || 'none'}, size: ${stats.size} bytes, description: ${data.description || 'none'})`);
       await socket.post('events', {
         text: `Updated blocklist ${blocklist.file} from ${blocklist.url} with ${data.tths.length} TTH(s) (version: ${newVersion || 'none'}, size: ${stats.size} bytes)`,
         severity: 'info'
@@ -399,7 +426,7 @@ function scheduleBlocklistUpdates(socket, settings, extension) {
   updateIntervalId = setInterval(async () => {
     console.log('[TTH Block] Checking for remote blocklist updates');
     for (const blocklist of blocklistFiles) {
-      if (blocklist.url) {
+      if (blocklist.url && blocklist.url !== 'Internal') {
         const updated = await fetchAndUpdateBlocklist(socket, settings, blocklist);
         if (updated) {
           updateSingleBlocklist(socket, settings, blocklist.file, true);
@@ -485,11 +512,19 @@ async function addToBlocklist(socket, settings, selectedIds, entityId, menuType)
     });
     return;
   }
-  if (!settings.getValue('custom_block_list')) {
-    console.log(`[TTH Block] Custom blocklist is disabled, skipping TTH addition`);
+  if (!settings.getValue('internal_block_list')) {
+    console.log(`[TTH Block] Internal blocklist is disabled, skipping TTH addition`);
     await socket.post('events', {
-      text: `Custom blocklist is disabled. Enable it in the extension settings to add TTHs`,
+      text: `Internal blocklist is disabled. Enable it in the extension settings to add TTHs`,
       severity: 'warning',
+    });
+    return;
+  }
+  if (!Array.isArray(selectedIds)) {
+    console.error(`[TTH Block] Invalid selectedIds format in ${menuType}: expected array, got ${typeof selectedIds}`);
+    await socket.post('events', {
+      text: `Failed to add TTHs from ${menuType === 'grouped_search_result' ? 'search results' : 'filelist'}: invalid selection format`,
+      severity: 'error',
     });
     return;
   }
@@ -504,38 +539,46 @@ async function addToBlocklist(socket, settings, selectedIds, entityId, menuType)
     }
     if (tth && !blockedTTHSet.has(tth)) {
       blockedTTHSet.add(tth);
-      const tthSet = blocklistTTHMap.get(path.basename(CUSTOM_BLOCKLIST_FILE)) || new Set();
+      const tthSet = blocklistTTHMap.get(path.basename(INTERNAL_BLOCKLIST_FILE)) || new Set();
       tthSet.add(tth);
-      blocklistTTHMap.set(path.basename(CUSTOM_BLOCKLIST_FILE), tthSet);
-      addedTTHs.push({ tth, comment: '' });
+      blocklistTTHMap.set(path.basename(INTERNAL_BLOCKLIST_FILE), tthSet);
+      addedTTHs.push({ tth, comment: '', timestamp: new Date().toISOString() });
     } else if (tth) {
       console.log(`[TTH Block] TTH ${tth} already in blocklist, skipping`);
     }
   }
   if (addedTTHs.length > 0) {
     try {
-      let blocklist = [];
-      if (fs.existsSync(CUSTOM_BLOCKLIST_FILE)) {
-        const data = fs.readFileSync(CUSTOM_BLOCKLIST_FILE, 'utf-8');
+      let blocklist = {
+        url: 'Internal',
+        version: 'Internal',
+        updated_at: new Date().toISOString(),
+        description: 'Internal',
+        tths: []
+      };
+      if (fs.existsSync(INTERNAL_BLOCKLIST_FILE)) {
+        const data = fs.readFileSync(INTERNAL_BLOCKLIST_FILE, 'utf-8');
         if (data.trim() !== '') {
           blocklist = JSON.parse(data);
-          if (!Array.isArray(blocklist)) {
-            console.warn(`[TTH Block] Invalid blocklist format in ${CUSTOM_BLOCKLIST_FILE}, resetting to empty array`);
-            blocklist = [];
+          if (!Array.isArray(blocklist.tths)) {
+            console.warn(`[TTH Block] Invalid blocklist format in ${INTERNAL_BLOCKLIST_FILE}, resetting tths`);
+            blocklist.tths = [];
           }
         }
       }
-      blocklist.push(...addedTTHs);
-      fs.writeFileSync(CUSTOM_BLOCKLIST_FILE, JSON.stringify(blocklist, null, 2), 'utf-8');
-      console.log(`[TTH Block] Added ${addedTTHs.length} TTH(s) to ${CUSTOM_BLOCKLIST_FILE}`);
+      blocklist.tths.push(...addedTTHs);
+      blocklist.updated_at = new Date().toISOString();
+      fs.writeFileSync(INTERNAL_BLOCKLIST_FILE, JSON.stringify(blocklist, null, 2), 'utf-8');
+      lastUpdateWriteTime.set(path.basename(INTERNAL_BLOCKLIST_FILE), Date.now());
+      console.log(`[TTH Block] Added ${addedTTHs.length} TTH(s) to ${INTERNAL_BLOCKLIST_FILE}`);
       await socket.post('events', {
-        text: `Added ${addedTTHs.length} TTH(s) to custom blocklist: ${addedTTHs.map(item => item.tth).join(', ')}`,
+        text: `Added ${addedTTHs.length} TTH(s) to internal blocklist: ${addedTTHs.map(item => item.tth).join(', ')}`,
         severity: 'info',
       });
     } catch (err) {
       console.error(`[TTH Block] Failed to write blocklist file: ${err.message}`);
       await socket.post('events', {
-        text: `Failed to write to custom blocklist: ${err.message}`,
+        text: `Failed to write to internal blocklist: ${err.message}`,
         severity: 'error',
       });
     }
@@ -558,8 +601,13 @@ async function watchBlocklistDir(socket, settings, extension) {
         debounceTimeout = setTimeout(async () => {
           try {
             console.log(`[TTH Block] Detected change in blocklist directory: ${filename} (${eventType})`);
-            const stats = fs.statSync(path.join(BLOCKLIST_DIR, filename));
-            if (Date.now() - lastUpdateWriteTime < 2000 && stats.mtimeMs > lastUpdateWriteTime) {
+            const filePath = path.join(BLOCKLIST_DIR, filename);
+            const stats = fs.statSync(filePath);
+            if (lastUpdateWriteTime.get(filename) === stats.mtimeMs) {
+              console.log(`[TTH Block] Skipping reload for ${filename}: no change since last update (mtime: ${stats.mtimeMs})`);
+              return;
+            }
+            if (Date.now() - (lastUpdateWriteTime.get(filename) || 0) < 2000) {
               console.log(`[TTH Block] Skipping reload for ${filename} due to recent fetch update`);
               return;
             }
@@ -571,8 +619,8 @@ async function watchBlocklistDir(socket, settings, extension) {
               console.log(`[TTH Block] New blocklists detected: ${pendingNewBlocklists.map(b => b.file).join(', ')}`);
               await updateSettingsDefinitions(socket, extension.name, pendingNewBlocklists);
               await socket.post('events', {
-                text: `New blocklists detected: ${pendingNewBlocklists.map(b => b.file).join(', ')}. Enable them in Settings > Extensions > Configure`,
-                severity: 'info'
+                text: `New blocklists detected: ${pendingNewBlocklists.map(b => b.file).join(', ')}. Enable them in Settings > Extensions > Configure and restart the extension to activate`,
+  severity: 'info'
               });
               console.log(`[TTH Block] Notified user: New blocklists ${pendingNewBlocklists.map(b => b.file).join(', ')} detected, settings updated`);
               pendingNewBlocklists.forEach(b => updateSingleBlocklist(socket, settings, b.file));
@@ -580,20 +628,13 @@ async function watchBlocklistDir(socket, settings, extension) {
             } else if (updatedBlocklist) {
               const oldBlocklist = oldBlocklists.find(b => b.file === filename);
               if (oldBlocklist && oldBlocklist.mtime !== updatedBlocklist.mtime) {
-                const reloaded = updateSingleBlocklist(socket, settings, filename);
-                if (reloaded) {
-                  const tthCount = blocklistTTHMap.get(filename)?.size || 0;
-                  await socket.post('events', {
-                    text: `Updated blocklist ${filename} with ${tthCount} TTH(s)`,
-                    severity: 'info'
-                  });
-                }
+                updateSingleBlocklist(socket, settings, filename);
               }
             }
           } catch (err) {
             console.error(`[TTH Block] Error in watchBlocklistDir handler: ${err.message}`);
           }
-        }, 1000);
+        }, 2000);
       }
     });
     console.log(`[TTH Block] Watching blocklist directory: ${BLOCKLIST_DIR}`);
@@ -618,13 +659,13 @@ module.exports = function (socket, extension) {
       const data = fs.readFileSync(configFile, 'utf-8');
       if (data.trim() === '') {
         console.warn(`[TTH Block] Config file ${configFile} is empty, recreating with defaults`);
-        fs.writeFileSync(configFile, JSON.stringify({ custom_block_list: true, update_interval: 60 }, null, 2), 'utf-8');
+        fs.writeFileSync(configFile, JSON.stringify({ internal_block_list: true, update_interval: 5 }, null, 2), 'utf-8');
       } else {
         JSON.parse(data); // Validate JSON
       }
     } else {
       console.log(`[TTH Block] Config file ${configFile} not found, creating with defaults`);
-      fs.writeFileSync(configFile, JSON.stringify({ custom_block_list: true, update_interval: 60 }, null, 2), 'utf-8');
+      fs.writeFileSync(configFile, JSON.stringify({ internal_block_list: true, update_interval: 5 }, null, 2), 'utf-8');
     }
     settings = SettingsManager(socket, {
       extensionName: extension.name,
@@ -632,8 +673,8 @@ module.exports = function (socket, extension) {
       configVersion: CONFIG_VERSION,
       definitions: [
         {
-          key: 'custom_block_list',
-          title: 'Enable/Disable custom blocklist',
+          key: 'internal_block_list',
+          title: 'Enable/Disable internal blocklist',
           default_value: true,
           type: 'boolean'
         },
@@ -644,12 +685,14 @@ module.exports = function (socket, extension) {
           type: 'number',
           min: 1
         },
-        ...blocklistFiles.map(blocklist => ({
-          key: `blocklist_${blocklist.file}`,
-          title: `Enable/Disable blocklist ${blocklist.file}`,
-          default_value: true,
-          type: 'boolean'
-        }))
+        ...blocklistFiles
+          .filter(blocklist => blocklist.file !== path.basename(INTERNAL_BLOCKLIST_FILE))
+          .map(blocklist => ({
+            key: `blocklist_${blocklist.file}`,
+            title: `Enable/Disable blocklist ${blocklist.file}${blocklist.description ? ` (${blocklist.description})` : ''}`,
+            default_value: true,
+            type: 'boolean'
+          }))
       ],
     });
     console.log(`[TTH Block] SettingsManager initialized successfully`);
@@ -658,9 +701,11 @@ module.exports = function (socket, extension) {
     settings = {
       getValue: (key) => {
         const def = [
-          { key: 'custom_block_list', default_value: true },
+          { key: 'internal_block_list', default_value: true },
           { key: 'update_interval', default_value: 60 },
-          ...blocklistFiles.map(b => ({ key: `blocklist_${b.file}`, default_value: true }))
+          ...blocklistFiles
+            .filter(b => b.file !== path.basename(INTERNAL_BLOCKLIST_FILE))
+            .map(b => ({ key: `blocklist_${b.file}`, default_value: true }))
         ].find(d => d.key === key);
         return def ? def.default_value : null;
       }
@@ -680,17 +725,7 @@ module.exports = function (socket, extension) {
 
       socket.addListener('extensions', 'extension_settings_updated', async (data) => {
         console.log(`[TTH Block] Settings updated:`, JSON.stringify(data, null, 2));
-        if (!settings || typeof settings.getValue !== 'function') {
-          console.error(`[TTH Block] Settings object is invalid during settings update, using defaults`);
-          blockedTTHSet.clear();
-          blocklistTTHMap.clear();
-          blocklistVersions.clear();
-          if (data.custom_block_list || blocklistFiles.some(b => data[`blocklist_${b.file}`])) {
-            loadBlockedTTHs(socket, settings);
-          }
-          return;
-        }
-        if (data.hasOwnProperty('custom_block_list') || blocklistFiles.some(b => data.hasOwnProperty(`blocklist_${b.file}`)) || data.hasOwnProperty('update_interval')) {
+        if (data.hasOwnProperty('internal_block_list') || blocklistFiles.some(b => data.hasOwnProperty(`blocklist_${b.file}`)) || data.hasOwnProperty('update_interval')) {
           console.log(`[TTH Block] Blocklist or update settings changed, reloading blockedTTHSet`);
           blocklistFiles = getBlocklistFiles();
           await updateSettingsDefinitions(socket, extension.name, blocklistFiles);
@@ -721,13 +756,14 @@ module.exports = function (socket, extension) {
               id: 'add_tth_to_blocklist',
               title: 'Add TTH to blocklist',
               icon: { semantic: 'ban' },
-              onClick: async (selectedIds, entityId) => {
-                console.log('[TTH Block] Search menu item "add_tth_to_blocklist" clicked with selectedIds:', selectedIds, 'entityId:', entityId);
+              onClick: async (data) => {
+                console.log('[TTH Block] Search menu item "add_tth_to_blocklist" clicked with data:', data);
+                const { selectedIds, entityId } = data;
                 await addToBlocklist(socket, settings, selectedIds, entityId, 'grouped_search_result');
               },
               access: 'search',
-              filter: (selectedIds) => {
-                console.log(`[TTH Block] Search menu filter result: true, selectedIds:`, selectedIds);
+              filter: (data) => {
+                console.log(`[TTH Block] Search menu filter result: true, data:`, data);
                 return true;
               }
             }
@@ -744,13 +780,14 @@ module.exports = function (socket, extension) {
               id: 'add_tth_to_blocklist',
               title: 'Add TTH to blocklist',
               icon: { semantic: 'ban' },
-              onClick: async (selectedIds, entityId) => {
-                console.log('[TTH Block] Filelist menu item "add_tth_to_blocklist" clicked with selectedIds:', selectedIds, 'entityId:', entityId);
+              onClick: async (data) => {
+                console.log('[TTH Block] Filelist menu item "add_tth_to_blocklist" clicked with data:', data);
+                const { selectedIds, entityId } = data;
                 await addToBlocklist(socket, settings, selectedIds, entityId, 'filelist_item');
               },
               access: 'filelists_view',
-              filter: (selectedIds, entityId) => {
-                console.log(`[TTH Block] Filelist menu filter result: true, selectedIds: ${selectedIds}, entityId: ${entityId}`);
+              filter: (data) => {
+                console.log(`[TTH Block] Filelist menu filter result: true, data:`, data);
                 return true;
               }
             }
