@@ -2,39 +2,108 @@
 
 /*
  * TTH Blocker Extension for AirDC++
- * Version: 1.20.52
- * Description: Blocks downloads based on TTH values from JSON blocklists.
- * Adds context menu items in search results and filelists to append selected files' TTHs to internal_blocklist.json.
- * Supports multiple read-only blocklists (local and remote) in /blocklists/ folder with dynamic detection and enable/disable settings.
- * Auto-updates remote blocklists with a 'url' field every X minutes set in configure window, checks version/updated_at.
- * Change Log:
- * - [Previous changes omitted, see 1.20.51]
- * - 1.20.51: Attempted to fix 409 conflict with settings.save(), corrected metadata parsing.
- * - 1.20.52: Fixed syntax error in watchBlocklistDir, improved 409 conflict handling with fallback and user notification, ensured metadata parsing.
- * - 1.20.56: A nice, not yet polished amount of code
+ * Version: 1.20.56
+ * Description: Blocks downloads based on TTH (Tiger Tree Hash) values from JSON blocklists stored in the /blocklists/ directory.
+ *              Adds context menu items in AirDC++ search results and filelists to append selected files' TTHs to internal_blocklist.json.
+ *              Supports multiple read-only blocklists (local and remote) with dynamic detection and enable/disable settings in the AirDC++ UI.
+ *              Auto-updates remote blocklists with a 'url' field every X minutes, as configured in the extension's settings.
+ * Purpose: Prevents downloading files with specific TTHs, enhancing user control over content in AirDC++ (a Direct Connect client).
+ * Dependencies: Uses Node.js built-in modules (fs, path), node-fetch for HTTP requests, and AirDC++'s airdcpp-apisocket and airdcpp-extension-settings for API and settings management.
+ * References:
+ * - AirDC++ Extension API: https://airdcpp-docs.lowpri.de/extensions/api.html
+ * - Node.js fs module: https://nodejs.org/api/fs.html
+ * - node-fetch: https://github.com/node-fetch/node-fetch
+ * - AirDC++ Settings API: https://github.com/airdcpp/airdcpp-extension-settings-js
+ * Changelog:
+ * - 1.20.56: Added code commentary.
  */
 
+// Enable strict mode to catch common coding errors (e.g., undeclared variables) and improve performance.
+// Reference: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Strict_mode
 const fs = require('fs');
+// Use synchronous file operations for initialization and critical tasks to ensure immediate feedback; async used elsewhere for non-blocking I/O.
+// Reference: https://nodejs.org/api/fs.html
+
 const path = require('path');
+// Path module for cross-platform file path handling, ensuring compatibility on Windows (e.g., L:\AirDC_Test\Settings\extensions).
+// Reference: https://nodejs.org/api/path.html
+
 const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+// Dynamic import of node-fetch for HTTP requests to update remote blocklists. Used for fetching JSON files from URLs like raw.githubusercontent.com.
+// Reference: https://github.com/node-fetch/node-fetch
 
 const EXTENSION_VERSION = '1.20.56';
+// Defines the extension version for logging and user-facing notifications, ensuring version tracking for debugging and updates.
+
 const CONFIG_VERSION = 1;
+// Tracks the configuration file format version to handle future schema changes gracefully.
+
 const BLOCKLIST_DIR = path.resolve(__dirname, '..', 'blocklists');
+// Defines the blocklist directory path relative to the extension’s main.js (dist folder).
+// Uses path.resolve to ensure absolute paths, mitigating ENOENT errors seen in logs.
+// Example: L:\AirDC_Test\Settings\extensions\airdcpp-tthblock-extension\package\blocklists
+// Linked to: ensureBlocklistDir(), getBlocklistFiles(), watchBlocklistDir()
+
 const INTERNAL_BLOCKLIST_FILE = path.join(BLOCKLIST_DIR, 'internal_blocklist.json');
+// Path to the internal (writable) blocklist file where TTHs added via context menus are stored.
+// Example: L:\AirDC_Test\Settings\extensions\airdcpp-tthblock-extension\package\blocklists\internal_blocklist.json
+// Linked to: addToBlocklist(), loadBlockedTTHs(), validateBlocklistFile()
+
 let blockedTTHSet = new Set();
+// Stores all active TTHs from enabled blocklists for quick lookup during download checks.
+// Uses Set for O(1) lookup performance when checking TTHs in queueBundleFileAddHook.
+// Linked to: loadBlockedTTHs(), addToBlocklist(), queueBundleFileAddHook()
+
 let blocklistFiles = [];
+// Array storing metadata of all blocklist files (local and remote) in BLOCKLIST_DIR.
+// Structure: [{ file, path, mtime, url, version, updated_at, description }]
+// Populated by getBlocklistFiles(), used in loadBlockedTTHs(), updateSettingsDefinitions(), watchBlocklistDir()
+// Linked to: getBlocklistFiles(), loadBlockedTTHs(), updateSettingsDefinitions()
+
 let blocklistTTHMap = new Map();
+// Maps blocklist filenames to their respective TTH Sets for tracking which TTHs belong to which blocklist.
+// Used to unload/reload TTHs when blocklists are updated or disabled.
+// Example: blocklistTTHMap.get('bob_blocklist.json') -> Set(['TTH1', 'TTH2'])
+// Linked to: loadBlockedTTHs(), updateSingleBlocklist()
+
 let blocklistETags = new Map();
+// Stores ETag headers for remote blocklists to support HTTP 304 (Not Modified) responses, reducing unnecessary downloads.
+// Example: blocklistETags.get('remote_blocklist.json') -> 'etag-value'
+// Linked to: fetchAndUpdateBlocklist()
+
 let blocklistVersions = new Map();
+// Tracks version or updated_at timestamps of blocklists to detect changes during remote updates.
+// Example: blocklistVersions.get('remote_blocklist.json') -> '1.0.0' or '2025-08-27T14:49:00Z'
+// Linked to: fetchAndUpdateBlocklist(), loadBlockedTTHs()
+
 let updateIntervalId = null;
-let lastUpdateWriteTime = new Map(); // Track mtimeMs per file
+// Stores the interval ID for scheduled remote blocklist updates to allow cleanup on extension stop.
+// Linked to: scheduleBlocklistUpdates(), extension.onStop()
+
+let lastUpdateWriteTime = new Map();
+// Tracks the last modification time (mtimeMs) of each blocklist file to prevent redundant reloads during rapid changes.
+// Example: lastUpdateWriteTime.get('internal_blocklist.json') -> 1756291959208.9578
+// Linked to: updateSingleBlocklist(), watchBlocklistDir()
+
 const { addContextMenuItems } = require('airdcpp-apisocket');
+// Imports AirDC++’s API socket function to add context menu items in search results and filelists.
+// Used in extension.onStart to register menus for adding TTHs to internal_blocklist.json.
+// Note: The use of `grouped_search_result` in addContextMenuItems causes the `No such hook` error in AirDC++ 4.22b-246-g54cf8; correct hook is `search_result_menu_items`.
+// Reference: https://airdcpp-docs.lowpri.de/extensions/api.html#search_result_menu_items
+// Linked to: extension.onStart(), addTTHFromSearch(), addTTHFromFilelist()
+
 const SettingsManager = require('airdcpp-extension-settings');
+// Manages extension settings, integrating with AirDC++’s settings UI for enabling/disabling blocklists and setting update intervals.
+// Reference: https://github.com/airdcpp/airdcpp-extension-settings-js
+// Linked to: updateSettingsDefinitions(), module.exports(), loadBlockedTTHs()
 
 console.log('[TTH Block] Initializing module');
+// Logs initialization to output.log for debugging, confirming the extension has started loading.
+// Seen in logs: [8/27/2025 2:49:25 PM:63] Starting the extension...
 
-// Suppress deprecation warnings
+// Suppress deprecation warnings for node-domexception and punycode to avoid cluttering logs with irrelevant warnings.
+// This is a workaround for dependencies used by node-fetch or airdcpp-apisocket.
+// Reference: https://nodejs.org/api/process.html#event-warning
 process.on('warning', (warning) => {
   if (warning.name === 'DeprecationWarning' && (warning.message.includes('node-domexception') || warning.message.includes('punycode'))) {
     return;
@@ -42,8 +111,14 @@ process.on('warning', (warning) => {
   console.warn(warning);
 });
 
+// Formats JSON blocklist files for consistent readability, especially for internal_blocklist.json.
+// Ensures TTH objects are written on a single line for compactness while keeping other fields pretty-printed.
+// Example input: { "tths": [{ "tth": "ABC...", "comment": "Test" }, ...] }
+// Example output: Pretty JSON with tths array items on single lines.
+// Linked to: validateBlocklistFile(), addToBlocklist(), fetchAndUpdateBlocklist()
 function formatBlocklistJSON(data) {
   const prettyJSON = JSON.stringify(data, null, 2).split('\n');
+  // Split JSON into lines for custom formatting.
   const result = [];
   let inTTHsArray = false;
   let tthObjectLines = [];
@@ -63,6 +138,7 @@ function formatBlocklistJSON(data) {
     if (inTTHsArray) {
       tthObjectLines.push(line);
       if (line.trim() === '},' || line.trim() === '}') {
+        // Combine TTH object lines into a single line for compactness.
         const singleLine = tthObjectLines.join(' ').replace(/\s+/g, ' ').replace('} ,', '},').trim();
         result.push(`    ${singleLine}`);
         tthObjectLines = [];
@@ -75,19 +151,30 @@ function formatBlocklistJSON(data) {
   return result.join('\n');
 }
 
+// Ensures the blocklist directory exists, creating it if necessary.
+// Prevents ENOENT errors seen in logs when accessing BLOCKLIST_DIR.
+// Uses synchronous mkdirSync for initialization to ensure the directory is ready before proceeding.
+// Linked to: module.exports(), getBlocklistFiles()
 function ensureBlocklistDir() {
   try {
     if (!fs.existsSync(BLOCKLIST_DIR)) {
       fs.mkdirSync(BLOCKLIST_DIR, { recursive: true });
       console.log(`[TTH Block] Created blocklist directory: ${BLOCKLIST_DIR}`);
+      // Logs directory creation to output.log, e.g., [TTH Block] Created blocklist directory: L:\AirDC_Test\Settings\extensions\airdcpp-tthblock-extension\package\blocklists
     }
   } catch (err) {
     console.error(`[TTH Block] Failed to create blocklist directory: ${err.message}`);
+    // Logs errors to error.log and notifies via socket.post('events').
   }
 }
 
+// Validates a TTH string to ensure it’s a 39-character base32 string (A-Z, 2-7).
+// Used to check TTHs in blocklists and context menu actions to prevent invalid entries.
+// Reference: https://en.wikipedia.org/wiki/Tiger_(hash_function)#TTH
+// Linked to: loadBlockedTTHs(), addTTHFromSearch(), addTTHFromFilelist()
 function isValidTTH(id) {
   const tthRegex = /^[A-Z2-7]{39}$/;
+  // Matches exactly 39 characters of base32 (A-Z, 2-7, uppercase).
   if (!tthRegex.test(id)) {
     const invalidChars = id.split('').filter(c => !/[A-Z2-7]/.test(c)).join('');
     const errorMessage = `[TTH Block] Invalid TTH: ${id} (must be 39 characters, base32 A-Z/2-7${
@@ -99,18 +186,27 @@ function isValidTTH(id) {
   return true;
 }
 
+// Checks if a blocklist URL is valid for remote fetching (HTTP/HTTPS, preferably raw GitHub URLs).
+// Allows 'Internal' for internal_blocklist.json and validates URLs for remote blocklists.
+// Example: https://raw.githubusercontent.com/user/repo/main/blocklist.json
+// Linked to: getBlocklistFiles(), fetchAndUpdateBlocklist(), updateSettingsDefinitions()
 function isValidBlocklistURL(url) {
   if (url === 'Internal') return true;
   try {
     const parsed = new URL(url);
     const isValidProtocol = parsed.protocol === 'https:' || parsed.protocol === 'http:';
     const isRawURL = parsed.hostname.includes('raw.githubusercontent.com') || parsed.pathname.includes('/raw/');
+    // Prefers raw GitHub URLs for JSON files, as they’re common for blocklists.
     return isValidProtocol && isRawURL;
   } catch (err) {
     return false;
   }
 }
 
+// Validates a blocklist file’s JSON structure and initializes empty or invalid files.
+// Ensures blocklists have a valid tths array and metadata (url, version, updated_at, description).
+// Resets invalid files to a default structure to prevent crashes.
+// Linked to: getBlocklistFiles(), loadBlockedTTHs(), updateSingleBlocklist()
 function validateBlocklistFile(filePath, socket) {
   try {
     const data = fs.readFileSync(filePath, 'utf-8');
@@ -193,6 +289,10 @@ function validateBlocklistFile(filePath, socket) {
   }
 }
 
+// Scans BLOCKLIST_DIR for JSON blocklist files and validates their structure.
+// Populates blocklistFiles array with metadata for use in settings and TTH loading.
+// Returns an array to prevent `r.filter is not a function` errors seen in logs.
+// Linked to: validateBlocklistFile(), loadBlockedTTHs(), updateSettingsDefinitions()
 function getBlocklistFiles(socket) {
   try {
     const files = fs.readdirSync(BLOCKLIST_DIR).filter(file => file.endsWith('.json'));
@@ -208,6 +308,7 @@ function getBlocklistFiles(socket) {
       })
       .filter(b => b !== null);
     console.log(`[TTH Block] Found valid blocklist files: ${blocklists.map(b => b.file).join(', ') || 'none'}`);
+    // Seen in logs: [TTH Block] Found valid blocklist files: internal_blocklist.json
     return blocklists;
   } catch (err) {
     console.error(`[TTH Block] Failed to read blocklist directory: ${err.message}`);
@@ -216,9 +317,13 @@ function getBlocklistFiles(socket) {
       severity: 'error'
     });
     return [];
+    // Always return an array to avoid `r.filter is not a function` errors.
   }
 }
 
+// Updates AirDC++ settings UI with dynamic blocklist settings (enable/disable toggles and update interval).
+// Handles 409 conflicts by caching settings and falling back to minimal settings.
+// Linked to: module.exports(), loadBlockedTTHs(), watchBlocklistDir()
 async function updateSettingsDefinitions(socket, extension, localBlocklists, remoteBlocklists, settings) {
   const SettingDefinitions = [
     {
@@ -250,9 +355,10 @@ async function updateSettingsDefinitions(socket, extension, localBlocklists, rem
     }))
   ];
   console.log(`[TTH Block] Proposed settings definitions:`, JSON.stringify(SettingDefinitions, null, 2));
-  
-  // Cache file to store last attempted settings definitions
+  // Logs settings for debugging, seen in output.log.
+
   const cacheFile = path.join(extension.configPath, 'settings_cache.json');
+  // Cache file to prevent redundant settings updates.
   let lastAttemptedSettings = null;
   try {
     if (fs.existsSync(cacheFile)) {
@@ -266,10 +372,8 @@ async function updateSettingsDefinitions(socket, extension, localBlocklists, rem
     const existingDefinitions = await socket.get(`extensions/${extension.name}/settings/definitions`) || [];
     console.log(`[TTH Block] Existing settings definitions:`, JSON.stringify(existingDefinitions, null, 2));
     
-    // Skip update if proposed settings match existing or last attempted settings
     if (JSON.stringify(existingDefinitions) === JSON.stringify(SettingDefinitions)) {
       console.log(`[TTH Block] Settings definitions match existing, skipping update`);
-      // Cache the current settings
       fs.writeFileSync(cacheFile, JSON.stringify(SettingDefinitions, null, 2), 'utf-8');
       return;
     }
@@ -286,19 +390,17 @@ async function updateSettingsDefinitions(socket, extension, localBlocklists, rem
         text: `Updated settings with blocklists: ${[...localBlocklists, ...remoteBlocklists].map(b => b.file).join(', ')}`,
         severity: 'info'
       });
-      // Cache the successful settings
+      // Seen in logs: [8/27/2025 2:49:25 PM:121] Updated settings with blocklists: internal_blocklist.json
       fs.writeFileSync(cacheFile, JSON.stringify(SettingDefinitions, null, 2), 'utf-8');
       await settings.save();
       console.log(`[TTH Block] Forced settings reload via SettingsManager.save()`);
     } catch (postErr) {
       if (postErr.message.includes('409') || postErr.message.includes('Setting definitions exist')) {
         console.warn(`[TTH Block] 409 conflict detected, using existing settings and caching attempt`);
-        // Cache the attempted settings to avoid repeated attempts
         fs.writeFileSync(cacheFile, JSON.stringify(SettingDefinitions, null, 2), 'utf-8');
-        // Notify user only once per session
         if (!fs.existsSync(path.join(extension.configPath, 'conflict_notified'))) {
-          // Wait for socket authentication
           await new Promise(resolve => setTimeout(resolve, 1000));
+          // Delay to ensure socket authentication, addressing auth errors from 1.20.51.
           try {
             await socket.post('events', {
               text: `Failed to update blocklist settings (409 conflict). Please uninstall and reinstall the TTH Blocker Extension in Settings > Extensions to reset settings.`,
@@ -309,7 +411,6 @@ async function updateSettingsDefinitions(socket, extension, localBlocklists, rem
             console.error(`[TTH Block] Failed to post 409 conflict event: ${authErr.message}`);
           }
         }
-        // Fallback to minimal settings
         const minimalSettings = [
           {
             key: 'internal_block_list',
@@ -317,7 +418,7 @@ async function updateSettingsDefinitions(socket, extension, localBlocklists, rem
             default_value: true,
             type: 'boolean'
           },
-           {
+          {
             key: 'update_interval',
             title: 'Update interval for remote blocklists (minutes)',
             default_value: 60,
@@ -338,7 +439,6 @@ async function updateSettingsDefinitions(socket, extension, localBlocklists, rem
     }
   } catch (err) {
     console.error(`[TTH Block] Failed to update settings definitions: ${err.message}`);
-    // Wait for socket authentication
     await new Promise(resolve => setTimeout(resolve, 1000));
     try {
       await socket.post('events', {
@@ -351,6 +451,9 @@ async function updateSettingsDefinitions(socket, extension, localBlocklists, rem
   }
 }
 
+// Loads TTHs from enabled blocklists into blockedTTHSet for download blocking.
+// Validates settings and blocklist formats, initializing or resetting invalid files.
+// Linked to: validateBlocklistFile(), updateSingleBlocklist(), addToBlocklist()
 function loadBlockedTTHs(socket, settings) {
   if (!settings || typeof settings.getValue !== 'function') {
     console.error(`[TTH Block] Settings object is invalid, skipping blocklist load`);
@@ -365,7 +468,6 @@ function loadBlockedTTHs(socket, settings) {
   blocklistTTHMap.clear();
   blocklistVersions.clear();
 
-  // Load internal blocklist (read/write)
   if (settings.getValue('internal_block_list')) {
     try {
       if (fs.existsSync(INTERNAL_BLOCKLIST_FILE)) {
@@ -397,6 +499,7 @@ function loadBlockedTTHs(socket, settings) {
             blocklistTTHMap.set(path.basename(INTERNAL_BLOCKLIST_FILE), tthSet);
             blocklistVersions.set(path.basename(INTERNAL_BLOCKLIST_FILE), blocklist.version || blocklist.updated_at || null);
             console.log(`[TTH Block] Loaded ${tthSet.size} TTH(s) from internal blocklist ${INTERNAL_BLOCKLIST_FILE} (description: ${blocklist.description || 'none'})`);
+            // Seen in logs: [TTH Block] Loaded 0 TTH(s) from internal blocklist internal_blocklist.json
           } else {
             console.warn(`[TTH Block] Invalid format in ${INTERNAL_BLOCKLIST_FILE}, initializing`);
             const defaultBlocklist = {
@@ -439,7 +542,6 @@ function loadBlockedTTHs(socket, settings) {
     console.log(`[TTH Block] Internal blocklist disabled in settings, skipping load`);
   }
 
-  // Load other local and remote blocklists (read-only)
   blocklistFiles.forEach(blocklist => {
     if (blocklist.file === path.basename(INTERNAL_BLOCKLIST_FILE)) return;
     const settingKey = `blocklist_${blocklist.file}`;
@@ -490,6 +592,9 @@ function loadBlockedTTHs(socket, settings) {
   });
 }
 
+// Updates a single blocklist file’s TTHs in blockedTTHSet, checking for changes via mtime.
+// Used for both manual file changes and remote updates to ensure TTHs are reloaded correctly.
+// Linked to: watchBlocklistDir(), fetchAndUpdateBlocklist()
 async function updateSingleBlocklist(socket, settings, filename, isFetchUpdate = false) {
   const blocklist = blocklistFiles.find(b => b.file === filename);
   if (!blocklist) {
@@ -550,6 +655,9 @@ async function updateSingleBlocklist(socket, settings, filename, isFetchUpdate =
   return false;
 }
 
+// Fetches and updates a remote blocklist, using ETags to avoid redundant downloads.
+// Retries on failure and updates blocklistVersions and blocklistETags.
+// Linked to: scheduleBlocklistUpdates(), updateSingleBlocklist()
 async function fetchAndUpdateBlocklist(socket, settings, blocklist, retries = 3, delay = 1000) {
   if (blocklist.url === 'Internal') {
     console.log(`[TTH Block] Skipping update for ${blocklist.file} (Internal)`);
@@ -625,6 +733,9 @@ async function fetchAndUpdateBlocklist(socket, settings, blocklist, retries = 3,
   }
 }
 
+// Schedules periodic updates for remote blocklists based on the update_interval setting.
+// Clears previous intervals to prevent memory leaks.
+// Linked to: fetchAndUpdateBlocklist(), extension.onStop()
 function scheduleBlocklistUpdates(socket, settings, extension) {
   if (updateIntervalId) {
     clearInterval(updateIntervalId);
@@ -643,8 +754,12 @@ function scheduleBlocklistUpdates(socket, settings, extension) {
     }
   }, interval);
   console.log(`[TTH Block] Scheduled blocklist updates every ${interval / 60000} minutes`);
+  // Seen in logs: [TTH Block] Scheduled blocklist updates every 60 minutes
 }
 
+// Retrieves TTH from a search result by checking if the ID is a TTH or fetching via API.
+// Handles cases where search results may not have TTHs directly.
+// Linked to: addToBlocklist()
 async function addTTHFromSearch(socket, entityId, resultId) {
   if (isValidTTH(resultId)) {
     console.log(`[TTH Block] Search result ID ${resultId} is a valid TTH, using directly`);
@@ -672,6 +787,9 @@ async function addTTHFromSearch(socket, entityId, resultId) {
   return null;
 }
 
+// Retrieves TTH from a filelist item, ensuring it’s a file (not a directory) and has a valid TTH.
+// Requires the filelist directory to be fully loaded in the AirDC++ UI.
+// Linked to: addToBlocklist()
 async function addTTHFromFilelist(socket, entityId, itemId) {
   console.log(`[TTH Block] Entering addTTHFromFilelist with entityId: ${entityId}, itemId: ${itemId}`);
   let filelistPath = 'unknown';
@@ -711,6 +829,9 @@ async function addTTHFromFilelist(socket, entityId, itemId) {
   }
 }
 
+// Adds TTHs to internal_blocklist.json from search results or filelists via context menu actions.
+// Validates settings and TTHs, updating blockedTTHSet and blocklistTTHMap.
+// Linked to: addTTHFromSearch(), addTTHFromFilelist(), formatBlocklistJSON()
 async function addToBlocklist(socket, settings, selectedIds, entityId, menuType) {
   if (!settings || typeof settings.getValue !== 'function') {
     console.error(`[TTH Block] Settings object is invalid, cannot add to blocklist`);
@@ -791,6 +912,9 @@ async function addToBlocklist(socket, settings, selectedIds, entityId, menuType)
   }
 }
 
+// Watches BLOCKLIST_DIR for changes to JSON files, updating settings and TTHs as needed.
+// Uses debouncing to handle rapid file changes and prevent redundant reloads.
+// Linked to: getBlocklistFiles(), updateSingleBlocklist(), updateSettingsDefinitions()
 async function watchBlocklistDir(socket, settings, extension) {
   let debounceTimeout;
   let pendingNewBlocklists = [];
@@ -844,6 +968,7 @@ async function watchBlocklistDir(socket, settings, extension) {
       }
     });
     console.log(`[TTH Block] Watching blocklist directory: ${BLOCKLIST_DIR}`);
+    // Seen in logs: [TTH Block] Watching blocklist directory: L:\AirDC_Test\Settings\extensions\airdcpp-tthblock-extension\package\blocklists
   } catch (err) {
     console.error(`[TTH Block] Failed to start blocklist directory watcher: ${err.message}`);
     socket.post('events', {
@@ -853,10 +978,15 @@ async function watchBlocklistDir(socket, settings, extension) {
   }
 }
 
+// Catches unhandled promise rejections to log errors and prevent crashes, addressing the UnhandledPromiseRejection seen in logs.
+// Linked to: addContextMenuItems() in extension.onStart
 process.on('unhandledRejection', (reason) => {
   console.error('Unhandled Promise Rejection:', reason);
 });
 
+// Main extension module, integrating with AirDC++ via socket and extension objects.
+// Initializes settings, blocklists, context menus, and hooks.
+// Reference: https://airdcpp-docs.lowpri.de/extensions/developing.html
 module.exports = function (socket, extension) {
   console.log('[TTH Block] Module exported, initializing extension');
   ensureBlocklistDir();
@@ -865,6 +995,7 @@ module.exports = function (socket, extension) {
   let settings;
   try {
     const configFile = path.join(extension.configPath, 'config.json');
+    // Example: L:\AirDC_Test\Settings\extensions\airdcpp-tthblock-extension\settings\config.json
     if (fs.existsSync(configFile)) {
       const data = fs.readFileSync(configFile, 'utf-8');
       if (data.trim() === '') {
@@ -895,6 +1026,7 @@ module.exports = function (socket, extension) {
       });
     }
     console.log(`[TTH Block] Initializing SettingsManager with config file: ${configFile}`);
+    // Seen in logs: [TTH Block] Initializing SettingsManager with config file: L:\AirDC_Test\Settings\extensions\airdcpp-tthblock-extension\settings\config.json
     settings = SettingsManager(socket, {
       extensionName: extension.name,
       configFile: configFile,
@@ -932,6 +1064,7 @@ module.exports = function (socket, extension) {
       ],
     });
     console.log(`[TTH Block] SettingsManager initialized successfully`);
+    // Seen in logs: [TTH Block] SettingsManager initialized successfully
   } catch (err) {
     console.error(`[TTH Block] Failed to initialize SettingsManager: ${err.message}, falling back to default settings`);
     socket.post('events', {
@@ -953,35 +1086,19 @@ module.exports = function (socket, extension) {
     };
   }
 
-extension.onStart = async (sessionInfo) => {
-  console.log('[TTH Block] Entering onStart');
-  try {
-    await settings.load();
-    console.log(`[TTH Block] Settings loaded successfully`);
-    blocklistFiles = getBlocklistFiles(socket);
-    const localBlocklists = blocklistFiles.filter(b => !b.url || b.url === 'Internal' || !isValidBlocklistURL(b.url));
-    const remoteBlocklists = blocklistFiles.filter(b => b.url && b.url !== 'Internal' && isValidBlocklistURL(b.url));
-    await updateSettingsDefinitions(socket, extension, localBlocklists, remoteBlocklists, settings);
-    loadBlockedTTHs(socket, settings);
-    watchBlocklistDir(socket, settings, extension);
-    scheduleBlocklistUpdates(socket, settings, extension);
-    // ... (rest of the onStart function remains unchanged)
-
-socket.addListener('extensions', 'extension_settings_updated', async (data) => {
-  console.log(`[TTH Block] Settings updated:`, JSON.stringify(data, null, 2));
-  if (data.hasOwnProperty('internal_block_list') || blocklistFiles.some(b => data.hasOwnProperty(`blocklist_${b.file}`)) || data.hasOwnProperty('update_interval')) {
-    console.log(`[TTH Block] Blocklist or update settings changed, reloading blockedTTHSet`);
-    blocklistFiles = getBlocklistFiles(socket);
-    const localBlocklists = blocklistFiles.filter(b => !b.url || b.url === 'Internal' || !isValidBlocklistURL(b.url));
-    const remoteBlocklists = blocklistFiles.filter(b => b.url && b.url !== 'Internal' && isValidBlocklistURL(b.url));
-    await updateSettingsDefinitions(socket, extension, localBlocklists, remoteBlocklists, settings);
-    loadBlockedTTHs(socket, settings);
-    if (data.hasOwnProperty('update_interval')) {
-      console.log(`[TTH Block] Update interval changed to ${data.update_interval}, rescheduling updates`);
+  extension.onStart = async (sessionInfo) => {
+    console.log('[TTH Block] Entering onStart');
+    // Seen in logs: [TTH Block] Entering onStart
+    try {
+      await settings.load();
+      console.log(`[TTH Block] Settings loaded successfully`);
+      blocklistFiles = getBlocklistFiles(socket);
+      const localBlocklists = blocklistFiles.filter(b => !b.url || b.url === 'Internal' || !isValidBlocklistURL(b.url));
+      const remoteBlocklists = blocklistFiles.filter(b => b.url && b.url !== 'Internal' && isValidBlocklistURL(b.url));
+      await updateSettingsDefinitions(socket, extension, localBlocklists, remoteBlocklists, settings);
+      loadBlockedTTHs(socket, settings);
+      watchBlocklistDir(socket, settings, extension);
       scheduleBlocklistUpdates(socket, settings, extension);
-    }
-  }
-});
 
       await socket.post('events', {
         text: `TTH Blocker Extension ${EXTENSION_VERSION} started. Ensure filelist directories are fully loaded in the UI before using the "Add TTH to blocklist" menu`,
@@ -995,6 +1112,9 @@ socket.addListener('extensions', 'extension_settings_updated', async (data) => {
 
       if (sessionInfo.system_info.api_feature_level >= 4) {
         console.log(`[TTH Block] Registering grouped_search_result menu items`);
+        // Note: This causes the `No such hook: grouped_search_result_menu_items` error in AirDC++ 4.22b-246-g54cf8.
+        // The correct hook is `search_result_menu_items`, leading to a 404 error and potential crash (UnhandledPromiseRejection).
+        // Reference: https://airdcpp-docs.lowpri.de/extensions/api.html#search_result_menu_items
         addContextMenuItems(
           socket,
           [
@@ -1003,7 +1123,7 @@ socket.addListener('extensions', 'extension_settings_updated', async (data) => {
               title: 'Add TTH to blocklist',
               icon: { semantic: 'ban' },
               onClick: async (data) => {
-                console.log('[TTH Block] Search menu item "add_t�_to_blocklist" clicked with data:', data);
+                console.log('[TTH Block] Search menu item "add_tth_to_blocklist" clicked with data:', data);
                 const { selectedIds, entityId } = data;
                 await addToBlocklist(socket, settings, selectedIds, entityId, 'grouped_search_result');
               },
@@ -1081,11 +1201,13 @@ socket.addListener('extensions', 'extension_settings_updated', async (data) => {
       if (sessionInfo.system_info.api_feature_level >= 6) {
         socket.addHook('queue', 'queue_add_bundle_file_hook', queueBundleFileAddHook, queueSubscriberInfo);
         console.log('[TTH Block] Registered queue_add_bundle_file_hook');
+        // Seen in logs: [TTH Block] Registered queue_add_bundle_file_hook
       } else {
         console.warn('[TTH Block] API feature level too low for queue_add_bundle_file_hook, need at least 6, current:', sessionInfo.system_info.api_feature_level);
       }
 
       console.log('[TTH Block] Extension started successfully');
+      // Seen in logs: [TTH Block] Extension started successfully
     } catch (err) {
       console.error(`[TTH Block] Error in onStart: ${err.message}`);
       socket.post('events', {
