@@ -1,5 +1,7 @@
 # TTH Blocker Extension for AirDC++
 
+** COMPLETE AI CODE - USE IT AT YOUR OWN RISK - CODE IS VERY MESSY (BETTER NOT USE IT AT ALL)**
+
 **Version**: 1.20.56
 
 **Description**: A extension for AirDC++ that prevents downloading files based on their TTH (Tiger Tree Hash) values. Block specific files by adding their TTHs to a custom blocklist or use pre-curated third-party blocklists from GitHub for advanced content filtering. Ideal for personal use or managing large-scale blocklists.
@@ -9,7 +11,7 @@
 - **Custom Blocklist**: Add TTHs manually from search results or filelists to a local, editable `internal_blocklist.json` for personal use.
 - **Third-Party Blocklists**: Load and auto-update read-only blocklists (e.g., `remote_blocklist.json`, `external2.json`) from GitHub repositories.
 - **Dynamic Blocklist Detection**: Automatically detects JSON blocklists in the `blocklists/` folder and adds toggle settings.
-- **Configurable Updates**: Set update intervals for remote blocklists (default: 60 minutes, recommended: 5 minutes due to GitHub caching).
+- **Configurable Updates**: Set update intervals for remote blocklists (default: 60 minutes).
 - **Context Menu Integration**: Right-click in AirDC++ search results or filelists to add TTHs to the custom blocklist.
 - **Detailed Logging**: Tracks blocklist updates, blocked downloads, and errors in AirDC++ logs.
 
