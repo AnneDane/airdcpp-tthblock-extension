@@ -1,7 +1,7 @@
 # TTH Blocker Extension for AirDC++
 
-**Version**: 1.20.44  
-**Description**: A powerful extension for AirDC++ that prevents downloading files based on their TTH (Tiger Tree Hash) values. Block specific files by adding their TTHs to a custom blocklist or use pre-curated third-party blocklists from GitHub for advanced content filtering. Ideal for personal use or managing large-scale blocklists.
+**Version**: 1.20.56
+**Description**: A extension for AirDC++ that prevents downloading files based on their TTH (Tiger Tree Hash) values. Block specific files by adding their TTHs to a custom blocklist or use pre-curated third-party blocklists from GitHub for advanced content filtering. Ideal for personal use or managing large-scale blocklists.
 
 ## Features
 - **Block Downloads by TTH**: Automatically prevents queuing files with TTHs listed in enabled blocklists.
